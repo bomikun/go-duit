@@ -1,0 +1,15 @@
+version: "2"
+
+linters:
+  enable:
+    - gosec
+    - misspell
+    - revive
+  exclusions:
+    rules:
+      # Tests and examples intentionally exercise the deprecated
+      # FromFloat/ToFloat float64 boundary.
+      - path: _test\.go
+        text: "SA1019"
+      - path: examples/
+        text: "SA1019"
