@@ -308,3 +308,135 @@ func TestZeroValueIsUsable(t *testing.T) {
 	}
 	mustEq(t, m.Add(NewFromInt(5)), "5")
 }
+
+func TestRoundingModes(t *testing.T) {
+	m := MustFromString("2.9")
+	mustEq(t, m.RoundDown(0), "2")
+	mustEq(t, m.RoundUp(0), "3")
+	mustEq(t, MustFromString("-2.9").RoundDown(0), "-2")
+	mustEq(t, MustFromString("-2.1").RoundUp(0), "-3")
+
+	// Faktur pajak: VAT rounded down to whole rupiah.
+	vat := MustFromString("164897.0359")
+	mustEq(t, vat.RoundDown(ScaleIDR), "164897")
+
+	// Banker's rounding: half goes to the even neighbour.
+	mustEq(t, MustFromString("2.5").RoundBank(0), "2")
+	mustEq(t, MustFromString("3.5").RoundBank(0), "4")
+	mustEq(t, MustFromString("2.345").RoundBank(2), "2.34")
+	mustEq(t, MustFromString("2.355").RoundBank(2), "2.36")
+}
+
+func TestAllocateRatios(t *testing.T) {
+	hundred := NewFromInt(100)
+
+	t.Run("proportional", func(t *testing.T) {
+		parts, err := hundred.AllocateRatios(ScaleIDR, 70, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEq(t, parts[0], "70")
+		mustEq(t, parts[1], "30")
+	})
+
+	t.Run("equal ratios match Allocate", func(t *testing.T) {
+		parts, err := hundred.AllocateRatios(ScaleIDR, 1, 1, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"34", "33", "33"}
+		for i, w := range want {
+			mustEq(t, parts[i], w)
+		}
+	})
+
+	t.Run("largest remainder wins the leftover unit", func(t *testing.T) {
+		// 100 at 1:2 -> exact shares 33.33 and 66.66; the leftover unit
+		// goes to the larger fractional remainder (index 1).
+		parts, err := hundred.AllocateRatios(ScaleIDR, 1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEq(t, parts[0], "33")
+		mustEq(t, parts[1], "67")
+		mustEq(t, Sum(parts[0], parts[1:]...), "100")
+	})
+
+	t.Run("zero ratio gets exactly zero", func(t *testing.T) {
+		parts, err := hundred.AllocateRatios(ScaleIDR, 1, 0, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEq(t, parts[1], "0")
+		mustEq(t, Sum(parts[0], parts[1:]...), "100")
+	})
+
+	t.Run("db scale", func(t *testing.T) {
+		parts, err := NewFromInt(1).AllocateRatios(ScaleDB, 1, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEq(t, parts[0], "0.3333")
+		mustEq(t, parts[1], "0.6667")
+		mustEq(t, Sum(parts[0], parts[1:]...), "1")
+	})
+
+	t.Run("negative amount", func(t *testing.T) {
+		parts, err := NewFromInt(-100).AllocateRatios(ScaleIDR, 70, 30)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustEq(t, parts[0], "-70")
+		mustEq(t, parts[1], "-30")
+		mustEq(t, Sum(parts[0], parts[1:]...), "-100")
+	})
+
+	t.Run("invalid ratios", func(t *testing.T) {
+		for _, ratios := range [][]int64{{}, {0, 0}, {1, -1}} {
+			if _, err := hundred.AllocateRatios(ScaleIDR, ratios...); !errors.Is(err, ErrInvalidRatios) {
+				t.Fatalf("ratios %v: got err %v, want ErrInvalidRatios", ratios, err)
+			}
+		}
+	})
+}
+
+func TestComparisons(t *testing.T) {
+	one, two := NewFromInt(1), NewFromInt(2)
+
+	if !one.LessThan(two) || two.LessThan(one) {
+		t.Fatal("LessThan broken")
+	}
+	if !one.LessThanOrEqual(one) || !one.LessThanOrEqual(two) {
+		t.Fatal("LessThanOrEqual broken")
+	}
+	if !two.GreaterThan(one) || one.GreaterThan(two) {
+		t.Fatal("GreaterThan broken")
+	}
+	if !two.GreaterThanOrEqual(two) || !two.GreaterThanOrEqual(one) {
+		t.Fatal("GreaterThanOrEqual broken")
+	}
+
+	mustEq(t, Min(two, one, NewFromInt(3)), "1")
+	mustEq(t, Max(one, NewFromInt(3), two), "3")
+	mustEq(t, Min(one), "1")
+	mustEq(t, Max(one), "1")
+}
+
+func TestFormatIDR(t *testing.T) {
+	cases := map[string]string{
+		"0":          "Rp0",
+		"5":          "Rp5",
+		"999":        "Rp999",
+		"1000":       "Rp1.000",
+		"1665000":    "Rp1.665.000",
+		"1234567890": "Rp1.234.567.890",
+		"-55000":     "-Rp55.000",
+		"1665000.49": "Rp1.665.000", // rounded half-up to whole rupiah
+		"1665000.5":  "Rp1.665.001",
+	}
+	for in, want := range cases {
+		if got := MustFromString(in).FormatIDR(); got != want {
+			t.Fatalf("FormatIDR(%s) = %q, want %q", in, got, want)
+		}
+	}
+}

@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"sort"
+	"strings"
 
 	"github.com/shopspring/decimal"
 )
@@ -39,6 +41,9 @@ var (
 	ErrDivideByZero = errors.New("duit: division by zero")
 	// ErrInvalidParts is returned by Allocate when n < 1.
 	ErrInvalidParts = errors.New("duit: number of parts must be >= 1")
+	// ErrInvalidRatios is returned by AllocateRatios when no ratios are
+	// given, a ratio is negative, or all ratios are zero.
+	ErrInvalidRatios = errors.New("duit: ratios must be non-negative with a positive sum")
 	// ErrScanNull is returned when scanning SQL NULL into Money; use
 	// NullMoney for nullable columns.
 	ErrScanNull = errors.New("duit: cannot scan NULL into Money, use NullMoney")
@@ -150,6 +155,19 @@ func (m Money) RoundDB() Money { return m.Round(ScaleDB) }
 // RoundIDR rounds to ScaleIDR, i.e. whole rupiah.
 func (m Money) RoundIDR() Money { return m.Round(ScaleIDR) }
 
+// RoundDown truncates toward zero at the given scale: 2.9 -> 2, -2.9 -> -2.
+// Indonesian tax invoices (faktur pajak) commonly require rounding VAT
+// down to whole rupiah; that is RoundDown(ScaleIDR).
+func (m Money) RoundDown(scale int32) Money { return Money{m.d.RoundDown(scale)} }
+
+// RoundUp rounds away from zero at the given scale: 2.1 -> 3, -2.1 -> -3.
+func (m Money) RoundUp(scale int32) Money { return Money{m.d.RoundUp(scale)} }
+
+// RoundBank rounds half to even (banker's rounding) at the given scale:
+// 2.5 -> 2, 3.5 -> 4. Use when a spec explicitly demands unbiased
+// rounding; the library default everywhere else is half-up.
+func (m Money) RoundBank(scale int32) Money { return Money{m.d.RoundBank(scale)} }
+
 // Div divides m by divisor, rounding half-up at the given scale.
 // The scale is mandatory: division is the operation that silently created
 // float64 drift, so every call site must state the precision it wants
@@ -211,6 +229,75 @@ func (m Money) Allocate(n int, scale int32) ([]Money, error) {
 	return parts, nil
 }
 
+// AllocateRatios splits m proportionally to the given non-negative ratios
+// at the given scale, such that the parts sum back to exactly
+// m.Round(scale). Distribution is largest-remainder: each part first gets
+// its exact proportional share truncated to whole smallest units, then the
+// leftover units go one at a time to the parts with the largest
+// fractional remainders (ties broken by lower index):
+//
+//	MustFromString("100").AllocateRatios(ScaleIDR, 70, 30) // [70 30]
+//	MustFromString("100").AllocateRatios(ScaleIDR, 1, 1, 1) // [34 33 33]
+//
+// A part with ratio 0 always receives exactly 0. For negative amounts the
+// distribution is applied to the absolute value and then negated.
+func (m Money) AllocateRatios(scale int32, ratios ...int64) ([]Money, error) {
+	if len(ratios) == 0 {
+		return nil, ErrInvalidRatios
+	}
+	ratioSum := new(big.Int)
+	for _, r := range ratios {
+		if r < 0 {
+			return nil, ErrInvalidRatios
+		}
+		ratioSum.Add(ratioSum, big.NewInt(r))
+	}
+	if ratioSum.Sign() == 0 {
+		return nil, ErrInvalidRatios
+	}
+
+	rounded := m.Round(scale)
+	negative := rounded.d.IsNegative()
+	total := rounded.d.Abs().Shift(scale).BigInt()
+
+	units := make([]*big.Int, len(ratios))
+	remainders := make([]struct {
+		idx int
+		rem *big.Int
+	}, len(ratios))
+	assigned := new(big.Int)
+	for i, r := range ratios {
+		num := new(big.Int).Mul(total, big.NewInt(r))
+		q, rem := new(big.Int).QuoRem(num, ratioSum, new(big.Int))
+		units[i] = q
+		remainders[i].idx = i
+		remainders[i].rem = rem
+		assigned.Add(assigned, q)
+	}
+
+	// 0 <= leftover < len(ratios), and only parts with a non-zero
+	// fractional remainder (hence non-zero ratio) can receive a unit.
+	leftover := new(big.Int).Sub(total, assigned).Int64()
+	sort.SliceStable(remainders, func(a, b int) bool {
+		return remainders[a].rem.Cmp(remainders[b].rem) > 0
+	})
+	one := big.NewInt(1)
+	for i := int64(0); i < leftover; i++ {
+		u := units[remainders[i].idx]
+		u.Add(u, one)
+	}
+
+	parts := make([]Money, len(ratios))
+	for i, u := range units {
+		d := decimal.NewFromBigInt(u, -scale)
+		if negative {
+			d = d.Neg()
+		}
+		parts[i] = Money{d}
+	}
+	return parts, nil
+}
+
 // --- comparison ---
 
 // Cmp returns -1 if m < o, 0 if equal, +1 if m > o.
@@ -228,6 +315,40 @@ func (m Money) IsNegative() bool { return m.d.IsNegative() }
 // IsPositive reports whether m > 0.
 func (m Money) IsPositive() bool { return m.d.IsPositive() }
 
+// LessThan reports whether m < o.
+func (m Money) LessThan(o Money) bool { return m.d.LessThan(o.d) }
+
+// LessThanOrEqual reports whether m <= o.
+func (m Money) LessThanOrEqual(o Money) bool { return m.d.LessThanOrEqual(o.d) }
+
+// GreaterThan reports whether m > o.
+func (m Money) GreaterThan(o Money) bool { return m.d.GreaterThan(o.d) }
+
+// GreaterThanOrEqual reports whether m >= o.
+func (m Money) GreaterThanOrEqual(o Money) bool { return m.d.GreaterThanOrEqual(o.d) }
+
+// Min returns the smallest of the given amounts.
+func Min(first Money, rest ...Money) Money {
+	minimum := first
+	for _, m := range rest {
+		if m.LessThan(minimum) {
+			minimum = m
+		}
+	}
+	return minimum
+}
+
+// Max returns the largest of the given amounts.
+func Max(first Money, rest ...Money) Money {
+	maximum := first
+	for _, m := range rest {
+		if m.GreaterThan(maximum) {
+			maximum = m
+		}
+	}
+	return maximum
+}
+
 // --- formatting ---
 
 // String returns the amount without trailing zeros, e.g. "115000.5".
@@ -236,6 +357,28 @@ func (m Money) String() string { return m.d.String() }
 // StringFixed returns the amount with exactly the given number of decimal
 // places, e.g. StringFixed(ScaleDB) -> "115000.5000".
 func (m Money) StringFixed(scale int32) string { return m.d.StringFixed(scale) }
+
+// FormatIDR renders the amount as whole rupiah with dot thousand
+// separators: "Rp1.665.000", or "-Rp55.000" for negative amounts.
+// The amount is rounded half-up to ScaleIDR first.
+func (m Money) FormatIDR() string {
+	rounded := m.RoundIDR()
+	digits := rounded.d.Abs().String()
+
+	var b strings.Builder
+	if rounded.IsNegative() {
+		b.WriteByte('-')
+	}
+	b.WriteString("Rp")
+	n := len(digits)
+	for i := 0; i < n; i++ {
+		if i > 0 && (n-i)%3 == 0 {
+			b.WriteByte('.')
+		}
+		b.WriteByte(digits[i])
+	}
+	return b.String()
+}
 
 // --- database/sql: NUMERIC(19,4) <-> Money ---
 
