@@ -43,10 +43,15 @@ third, _ := duit.NewFromInt(1).DivInt(3, duit.ScaleDB) // 0.3333 — scale is al
   - `Div(divisor, scale)` / `DivInt(n, scale)` — the scale argument is **mandatory**; division is where float64 drift is born, so every call site states the precision it wants.
   - `PercentOf(pct, scale)` — exact multiply, a single rounding at the end.
   - `Round(scale)`, `RoundDB()`, `RoundIDR()`.
+  - `RoundDown` / `RoundUp` / `RoundBank` — explicitly named modes for specs that demand them (e.g. Indonesian tax invoices round VAT **down**: `vat.RoundDown(duit.ScaleIDR)`).
   - `Value()` — database writes are canonicalized to `ScaleDB`.
 - **`Allocate(n, scale)` never loses a unit.** Largest-remainder split: `100 → [34 33 33]` at `ScaleIDR`, `[33.3334 33.3333 33.3333]` at `ScaleDB` — parts always sum back exactly.
+- **`AllocateRatios(scale, ratios...)`** splits proportionally with the same exact-sum guarantee: `100 → [70 30]` for `(70, 30)`; a ratio of 0 always receives exactly 0.
+- Comparisons read like prose — `LessThan`, `GreaterThanOrEqual`, … — plus `duit.Min`/`duit.Max` for caps and floors.
+- `FormatIDR()` renders `"Rp1.665.000"` (dot thousand separators, whole rupiah).
 - **Scales as constants**: `ScaleDB = 4` (PostgreSQL `NUMERIC(19,4)`), `ScaleIDR = 0` (whole rupiah).
 - The zero value of `Money` is `0` and ready to use.
+- Parsing, JSON, SQL scanning, and the allocation invariants are **fuzz-tested**.
 
 ## Database (PostgreSQL `NUMERIC`)
 
